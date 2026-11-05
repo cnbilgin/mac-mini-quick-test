@@ -1,0 +1,1 @@
+MacMini Quick Condition Tester
