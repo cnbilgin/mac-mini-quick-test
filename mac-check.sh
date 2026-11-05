@@ -32,11 +32,17 @@ RUNS=2
 DO_SPEED=1
 DEEP_LOGS=0
 OPEN_WARRANTY=0
+BRIEF=0
+SUDO_MODE=0
 TEST_DIR=""
 WARNINGS=""
 WARNING_COUNT=0
 VERDICT_LEVEL="ok"
 VERDICT_TEXT=""
+FW_PASS_TEXT=""
+FW_PASS_ENABLED=0
+PROFILES_TEXT=""
+SUDO_SKIPPED=0
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -74,6 +80,8 @@ Options:
   --no-speed      Skip the disk speed test
   --deep-logs     Also scan the unified log (slower, may take 10-30s)
   --warranty      Open Apple's warranty page and copy the serial
+  --brief         Show only the quick summary and warnings
+  --sudo          Also check firmware password and installed profiles (prompts)
   --no-color      Disable ANSI colors
   -h, --help      Show this help
 
@@ -129,7 +137,12 @@ add_warning() {
 
 plist_get() {
   # $1 = plist/JSON text, $2 = key path
-  printf '%s' "$1" | /usr/bin/plutil -extract "$2" raw -o - - 2>/dev/null
+  local out
+  out=$(printf '%s' "$1" | /usr/bin/plutil -extract "$2" raw -o - - 2>/dev/null)
+  case "$out" in
+    *"Could not extract value"*|*"invalid key path"*|*"Unexpected character"*) printf '' ;;
+    *) printf '%s' "$out" ;;
+  esac
 }
 
 format_bytes() {
@@ -201,6 +214,8 @@ while [ $# -gt 0 ]; do
     --no-speed) DO_SPEED=0 ;;
     --deep-logs) DEEP_LOGS=1 ;;
     --warranty) OPEN_WARRANTY=1 ;;
+    --brief) BRIEF=1 ;;
+    --sudo) SUDO_MODE=1 ;;
     --no-color)
       BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""; BLUE=""; NC=""
       ;;
@@ -327,6 +342,27 @@ collect_security() {
   SIP_TEXT=$(csrutil status 2>/dev/null | head -1 | sed 's/^System Integrity Protection status: //; s/\.$//')
   GK_TEXT=$(spctl --status 2>/dev/null | head -1)
   SUPERVISED=$(printf '%s\n' "$NVRAM_TEXT" | awk '$1=="supervised" {print $2; exit}')
+
+  FW_PASS_TEXT=""
+  FW_PASS_ENABLED=0
+  PROFILES_TEXT=""
+  SUDO_SKIPPED=0
+  if [ "$SUDO_MODE" = "1" ]; then
+    if [ -t 0 ]; then
+      if sudo -v; then
+        FW_PASS_TEXT=$(sudo firmwarepasswd -check 2>&1)
+        PROFILES_TEXT=$(sudo profiles -P 2>/dev/null | head -20)
+      else
+        SUDO_SKIPPED=1
+      fi
+    else
+      SUDO_SKIPPED=1
+    fi
+    case "$FW_PASS_TEXT" in
+      *"Password Enabled: Yes"*) FW_PASS_ENABLED=1 ;;
+      *) FW_PASS_ENABLED=0 ;;
+    esac
+  fi
 }
 
 collect_storage() {
@@ -343,6 +379,27 @@ collect_storage() {
     DISK="disk0"
     DISK_PLIST=$(diskutil info -plist "$DISK" 2>/dev/null)
   fi
+
+  # Prefer an internal disk. This avoids picking a mounted DMG or external disk
+  # if system_profiler was unavailable and the fallback list started with one.
+  INTERNAL_CHECK=$(plist_get "$DISK_PLIST" "Internal")
+  case "$INTERNAL_CHECK" in
+    1|true|TRUE|yes) : ;;
+    *)
+      for candidate in disk0 disk1 disk2 disk3 disk4; do
+        CAND_PLIST=$(diskutil info -plist "$candidate" 2>/dev/null)
+        [ -z "$CAND_PLIST" ] && continue
+        CAND_INTERNAL=$(plist_get "$CAND_PLIST" "Internal")
+        case "$CAND_INTERNAL" in
+          1|true|TRUE|yes)
+            DISK="$candidate"
+            DISK_PLIST="$CAND_PLIST"
+            break
+            ;;
+        esac
+      done
+      ;;
+  esac
 
   DISK_MODEL=$(plist_get "$DISK_PLIST" "MediaName")
   [ -z "$DISK_MODEL" ] && DISK_MODEL=$(plist_get "$DISK_PLIST" "IORegistryEntryName")
@@ -484,6 +541,15 @@ build_warnings() {
   if [ "$FV_TEXT" = "On" ]; then
     add_warning "FileVault is On. The seller must provide the password or erase the Mac before the trade."
   fi
+  if [ "$FW_PASS_ENABLED" = "1" ]; then
+    add_warning "Firmware password is ENABLED. The seller must remove it before the trade."
+  fi
+  if [ "$SUDO_MODE" = "1" ] && [ "$SUDO_SKIPPED" = "1" ]; then
+    add_warning "Firmware password/profiles check was skipped (no terminal for sudo). Re-run --sudo interactively."
+  fi
+  if [ -n "$PROFILES_TEXT" ] && ! printf '%s' "$PROFILES_TEXT" | grep -qi 'no configuration profiles'; then
+    add_warning "Installed configuration profiles were found. Review them with: sudo profiles -P"
+  fi
 
   case "$SIP_TEXT" in
     *disabled*|*Custom*) add_warning "System Integrity Protection (SIP) is disabled or customized." ;;
@@ -504,7 +570,12 @@ build_warnings() {
     add_warning "SSD reports $MEDIA_ERRORS media error(s)."
   fi
   if [ -n "$UNSAFE" ] && [ "$UNSAFE" -gt 0 ] 2>/dev/null; then
-    add_warning "SSD reports $UNSAFE unsafe shutdown(s)."
+    if [ -n "$CYCLES" ] && [ "$CYCLES" -gt 0 ] 2>/dev/null; then
+      UNSAFE_PCT=$(awk -v u="$UNSAFE" -v c="$CYCLES" 'BEGIN{printf "%.1f", u*100/c}')
+      add_warning "SSD reports $UNSAFE unsafe shutdown(s) out of $CYCLES power cycles (~${UNSAFE_PCT}%). Usually forced power-offs or shutdown stalls; watch whether it increases."
+    else
+      add_warning "SSD reports $UNSAFE unsafe shutdown(s). Usually forced power-offs or shutdown stalls; watch whether it increases."
+    fi
   fi
   if [ -n "$SPARE" ] && [ -n "$SPARE_THRESHOLD" ] && [ "$SPARE" -lt "$SPARE_THRESHOLD" ] 2>/dev/null; then
     add_warning "Available spare (${SPARE}%) is below threshold (${SPARE_THRESHOLD}%)."
@@ -514,7 +585,7 @@ build_warnings() {
   fi
 
   [ "$PANICS" -gt 0 ] 2>/dev/null && add_warning "Found $PANICS kernel panic report(s)."
-  [ "$STALLS" -gt 0 ] 2>/dev/null && add_warning "Found $STALLS shutdown stall report(s)."
+  [ "$STALLS" -gt 0 ] 2>/dev/null && add_warning "Found $STALLS shutdown stall report(s). Decode with: spindump -i <file>"
   [ "$USER_PANICS" -gt 0 ] 2>/dev/null && add_warning "Found $USER_PANICS user kernel panic report(s)."
   [ "$INSTALL_ERRORS" -gt 0 ] 2>/dev/null && add_warning "Install log contains $INSTALL_ERRORS error line(s)."
 
@@ -559,8 +630,14 @@ compute_verdict() {
     VERDICT_TEXT="STOP: MDM/DEP is not confirmed clean. Do not complete the trade until enrollment is removed."
     return
   fi
+  if [ "$FW_PASS_ENABLED" = "1" ]; then
+    VERDICT_LEVEL="bad"
+    VERDICT_TEXT="STOP: Firmware password is ENABLED. The seller must remove it before the trade."
+    return
+  fi
 
   HEALTH_CHECK=0
+  [ "$SUDO_MODE" = "1" ] && [ "$SUDO_SKIPPED" = "1" ] && HEALTH_CHECK=1
   [ "$SUPERVISED" = "true" ] && HEALTH_CHECK=1
   [ "$FV_TEXT" = "On" ] && HEALTH_CHECK=1
   case "$SIP_TEXT" in *disabled*|*Custom*) HEALTH_CHECK=1 ;; esac
@@ -569,6 +646,9 @@ compute_verdict() {
   [ -n "$WEAR" ] && [ "$WEAR" -ge 50 ] 2>/dev/null && HEALTH_CHECK=1
   [ -n "$MEDIA_ERRORS" ] && [ "$MEDIA_ERRORS" -gt 0 ] 2>/dev/null && HEALTH_CHECK=1
   [ -n "$UNSAFE" ] && [ "$UNSAFE" -gt 0 ] 2>/dev/null && HEALTH_CHECK=1
+  if [ -n "$PROFILES_TEXT" ] && ! printf '%s' "$PROFILES_TEXT" | grep -qi 'no configuration profiles'; then
+    HEALTH_CHECK=1
+  fi
   [ "$PANICS" -gt 0 ] 2>/dev/null && HEALTH_CHECK=1
   [ "$STALLS" -gt 0 ] 2>/dev/null && HEALTH_CHECK=1
   [ "$INSTALL_ERRORS" -gt 0 ] 2>/dev/null && HEALTH_CHECK=1
@@ -631,6 +711,31 @@ print_quick_summary() {
     status_line "FileVault" "${FV_TEXT:-unknown}" warn
   fi
 
+  if [ "$SUDO_MODE" = "1" ]; then
+    if [ "$SUDO_SKIPPED" = "1" ]; then
+      kv "Firmware password" "not checked (sudo skipped)"
+    elif [ "$FW_PASS_ENABLED" = "1" ]; then
+      status_line "Firmware password" "ENABLED" bad
+    elif printf '%s' "$FW_PASS_TEXT" | grep -qi 'Password Enabled: No'; then
+      status_line "Firmware password" "Disabled" ok
+    elif printf '%s' "$FW_PASS_TEXT" | grep -qi 'not supported'; then
+      status_line "Firmware password" "not supported on this Mac" ok
+    elif [ -n "$FW_PASS_TEXT" ]; then
+      status_line "Firmware password" "$(printf '%s' "$FW_PASS_TEXT" | head -1)" warn
+    else
+      kv "Firmware password" "not reported"
+    fi
+    if [ -n "$PROFILES_TEXT" ]; then
+      if printf '%s' "$PROFILES_TEXT" | grep -qi 'no configuration profiles'; then
+        status_line "Configuration profiles" "none" ok
+      else
+        status_line "Configuration profiles" "$(printf '%s' "$PROFILES_TEXT" | head -1)" warn
+      fi
+    fi
+  else
+    kv "Firmware password" "not checked (use --sudo)"
+  fi
+
   if [ "$SMART" = "Verified" ]; then
     status_line "SMART status" "$SMART" ok
   elif [ -n "$SMART" ]; then
@@ -660,7 +765,12 @@ print_quick_summary() {
   elif [ "$UNSAFE" -eq 0 ] 2>/dev/null; then
     status_line "SSD unsafe shutdowns" "$UNSAFE" ok
   else
-    status_line "SSD unsafe shutdowns" "$UNSAFE" warn
+    if [ -n "$CYCLES" ] && [ "$CYCLES" -gt 0 ] 2>/dev/null; then
+      UNSAFE_PCT=$(awk -v u="$UNSAFE" -v c="$CYCLES" 'BEGIN{printf "%.1f", u*100/c}')
+      status_line "SSD unsafe shutdowns" "$UNSAFE (~${UNSAFE_PCT}% of cycles)" warn
+    else
+      status_line "SSD unsafe shutdowns" "$UNSAFE" warn
+    fi
   fi
 
   if [ -n "$HOURS" ] || [ -n "$CYCLES" ] || [ -n "$UNITS_WRITTEN" ]; then
@@ -669,6 +779,10 @@ print_quick_summary() {
     [ -n "$UNITS_WRITTEN" ] && kv "Data written" "$(format_data_units "$UNITS_WRITTEN")"
   else
     kv "SSD lifetime counters" "not exposed on this Mac"
+  fi
+
+  if [ -n "$UNSAFE" ] && [ "$UNSAFE" -gt 0 ] 2>/dev/null; then
+    note "Unsafe shutdowns are cumulative; a low ratio is usually forced power-offs or shutdown stalls."
   fi
 
   if [ "$PANICS" -eq 0 ] 2>/dev/null; then
@@ -795,6 +909,23 @@ print_security() {
   [ -n "$SIP_TEXT" ] && kv "SIP" "$SIP_TEXT"
   [ -n "$GK_TEXT" ] && kv "Gatekeeper" "$GK_TEXT"
   [ -n "$SUPERVISED" ] && kv "Supervised" "$SUPERVISED"
+
+  if [ "$SUDO_MODE" = "1" ]; then
+    if [ "$SUDO_SKIPPED" = "1" ]; then
+      kv "Firmware password" "not checked (sudo skipped)"
+    elif [ -n "$FW_PASS_TEXT" ]; then
+      kv "Firmware password" "$(printf '%s' "$FW_PASS_TEXT" | head -1)"
+    else
+      kv "Firmware password" "not reported"
+    fi
+    if [ -n "$PROFILES_TEXT" ]; then
+      note "Installed configuration profiles:"
+      printf '%s\n' "$PROFILES_TEXT" | sed 's/^/    /'
+    fi
+  else
+    note "Firmware password not checked. Re-run with --sudo to check it."
+    note "Installed profiles not checked. Re-run with --sudo (profiles -P)."
+  fi
 
   kv "Warranty check" "https://checkcoverage.apple.com/"
   kv "Serial to enter" "$SERIAL"
@@ -954,6 +1085,11 @@ print_stability() {
     printf '%s\n' "$LATEST" | sed 's/^/    /'
   fi
 
+  if [ "$STALLS" -gt 0 ] 2>/dev/null; then
+    note "Decode a shutdown stall report with: spindump -i <file>"
+    note "It writes the readable report to /tmp/spindump.txt."
+  fi
+
   kv "Install log errors" "$INSTALL_ERRORS"
   if [ "$INSTALL_ERRORS" -gt 0 ] 2>/dev/null; then
     warn_line "Recent install log contains:"
@@ -1069,8 +1205,8 @@ print_manual() {
   note "Apple warranty / coverage: https://checkcoverage.apple.com/"
   note "  Enter serial: $SERIAL"
   note "Apple Diagnostics: shut down; hold power (Apple Silicon) or D (Intel) at startup."
-  note "Firmware password: sudo firmwarepasswd -check"
-  note "Installed configuration profiles: profiles -P  (requires sudo)"
+  note "Firmware password: run with --sudo, or sudo firmwarepasswd -check"
+  note "Installed configuration profiles: run with --sudo, or sudo profiles -P"
   note "Detailed SSD SMART: sudo smartctl -a /dev/$DISK  (only if smartmontools is installed)"
   note "Ports: test every USB, Thunderbolt, HDMI, Ethernet and audio port."
   note "Thermals/fans: run a CPU load and check that the Mac stays quiet and does not throttle."
@@ -1113,6 +1249,12 @@ case "$WARNING_COUNT" in ''|*[!0-9]*) WARNING_COUNT=0 ;; esac
 
 print_header
 print_quick_summary
+
+if [ "$BRIEF" = "1" ]; then
+  print_warnings
+  note "Full details skipped (--brief). Run without --brief for all sections."
+  exit 0
+fi
 
 print_identity
 collect_dates

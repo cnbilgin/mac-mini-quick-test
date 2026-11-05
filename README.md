@@ -2,7 +2,7 @@
 
 A single-file, dependency-free macOS condition report for a new or used Mac — built for quickly checking a used Mac mini, but works on any Mac.
 
-No Homebrew. No Python. No sudo. Just built-in macOS tools.
+No Homebrew. No Python. No sudo required. Just built-in macOS tools.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cnbilgin/mac-mini-quick-test/master/mac-check.sh | bash
@@ -94,16 +94,22 @@ Save the report:
 | `--no-speed` | Skip the disk speed test |
 | `--deep-logs` | Also scan the unified log (slower, may take 10–30 s) |
 | `--warranty` | Copy the serial to the clipboard and open Apple's coverage page |
+| `--brief` | Show only the quick summary and warnings (fast, low detail) |
+| `--sudo` | Also check firmware password and installed profiles (prompts for your password) |
 | `--no-color` | Disable ANSI colors |
 | `-h`, `--help` | Show help |
 
 Examples:
 
 ```bash
-./mac-check.sh --size 1024 --runs 3
+./mac-check.sh --brief
 ./mac-check.sh --no-speed --warranty
+./mac-check.sh --sudo --no-speed
+./mac-check.sh --size 1024 --runs 3
 ./mac-check.sh --deep-logs | tee mac-report.txt
 ```
+
+`--brief` is useful when you only want the trade summary. `--sudo` runs two extra read-only checks: `firmwarepasswd -check` and `profiles -P`. It does not change anything.
 
 ## What survives a macOS reset?
 
@@ -151,12 +157,60 @@ Highlights:
 |---|---|
 | Quick summary | Trade blockers and health checks at the top, with a verdict |
 | Identity | Model, chip, RAM, serial, hardware UUID, provisioning UDID |
-| Ownership | Activation Lock, MDM/DEP enrollment, supervision, FileVault, SIP, Gatekeeper |
+| Ownership | Activation Lock, MDM/DEP enrollment, supervision, FileVault, SIP, Gatekeeper; firmware password and profiles with `--sudo` |
 | Warranty | Serial + `checkcoverage.apple.com` link |
 | SSD | Model, SMART status, wear, spare, power-on hours, power cycles, unsafe shutdowns, media errors, data written/read |
 | Speed | Sequential write/read using `dd` with direct I/O (cache bypassed) |
 | Stability | Kernel panics, shutdown stalls, Jetsam events, install-log errors, reboot history |
 | Hardware | GPU, displays, Wi-Fi, Bluetooth, Thunderbolt/USB4, USB, Ethernet, battery |
+
+## Reading the warnings
+
+| Warning | What to do |
+|---|---|
+| Activation Lock `[STOP]` | The seller must sign out of iCloud/Find My. Do not trade until it is Disabled. |
+| MDM/DEP `[STOP]` | The seller must remove enrollment. Get written confirmation. |
+| Firmware password `[STOP]` | The seller must remove it (`sudo firmwarepasswd -clear`) before the trade. |
+| FileVault `[CHECK]` | The seller must provide the password or erase the Mac. |
+| Supervised `[CHECK]` | Confirm it is not organization-owned. |
+| SMART not Verified / media errors | Back up, run Apple Diagnostics, and consider returning the Mac. |
+| SSD wear ≥ 50% | Negotiate the price; compare with data written and power-on hours. |
+| Unsafe shutdowns `[CHECK]` | Usually forced power-offs. Compare with power cycles; watch whether it increases. |
+| Kernel panics / shutdown stalls `[CHECK]` | Decode the reports; look for repeat patterns. Often software, not hardware. |
+| Battery health bad | Budget for a battery replacement. |
+
+### SSD unsafe shutdowns
+
+`Unsafe shutdowns` is a cumulative NVMe SMART counter. It increments when the SSD loses power without a clean shutdown/flush — for example:
+
+- holding the power button
+- power loss or unplugging
+- a kernel panic or forced restart
+- a shutdown stall that ends in a forced power-off
+
+It is **not** the same as SSD wear. A low number relative to `Power cycles` is usually harmless. Example: 6 unsafe shutdowns / 274 power cycles = ~2.2%, with 0 media errors and 0% wear is a healthy-looking drive.
+
+What to check:
+
+1. Compare `Unsafe shutdowns` to `Power cycles` and `Power-on hours`.
+2. Note the number, then re-run the script after a week of clean shutdowns. If it does not increase, it is historical.
+3. Check `Media errors`, `SMART status`, and `Kernel panics`. Media errors > 0 or SMART not Verified are more serious.
+4. Check power: battery/charger on a laptop; cable/UPS on a Mac mini.
+5. If it keeps increasing without forced power-offs, run Apple Diagnostics and inspect shutdown-stall reports.
+
+### Shutdown stalls
+
+A `.shutdownStall` report means macOS noticed a slow or stuck shutdown. It is often software (an app or background service not quitting), not a failing SSD. A 1-second stall with many background apps is usually benign.
+
+Inspect it with:
+
+```bash
+ls -lt /Library/Logs/DiagnosticReports/*.shutdownStall
+spindump -i /Library/Logs/DiagnosticReports/<file>.shutdownStall
+# readable report: /tmp/spindump.txt
+```
+
+If stalls repeat, note which apps are open, try Safe Mode, and check login items/background agents.
 
 ## Important limits
 

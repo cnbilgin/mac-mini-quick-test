@@ -36,8 +36,9 @@ The first section of the report is the trade-focused summary. It is printed befo
 
 - Find My / Activation Lock is **Enabled** or **Unknown**
 - MDM/DEP enrollment is not confirmed clean
+- Firmware password is **Enabled** (checked with `--sudo`)
 
-The verdict is `STOP` if either is present.
+The verdict is `STOP` if any of these is present.
 
 ### `[CHECK]` conditions
 
@@ -53,12 +54,16 @@ The verdict is `STOP` if either is present.
 - Shutdown stalls > 0
 - Install log contains errors
 - Battery health is Service/Replace/Poor
+- Configuration profiles were found (`--sudo`)
+- Firmware password/profiles check was requested but skipped (`--sudo` without a terminal)
 
 The verdict is `CHECK` if any of these is present and there is no `[STOP]`.
 
 Otherwise the verdict is `OK`.
 
 The disk speed test and `--deep-logs` scan run after the quick summary, so warnings from those appear only in the final **Warnings** section. The summary's warning count is taken before those two checks.
+
+Use `--brief` to print only the quick summary and the warnings.
 
 ## 1. Identity
 
@@ -106,6 +111,10 @@ If the install is only a few days old, the script prints a warning that it is li
 | SIP | enabled | Disabled may indicate tampering |
 | Gatekeeper | assessments enabled | Disabled may indicate tampering |
 | Supervised | false | true means it was managed by an organization |
+| Firmware password (`--sudo`) | No / Disabled | Yes means the seller must remove it before the trade |
+| Configuration profiles (`--sudo`) | None | Any profile should be reviewed |
+
+`--sudo` runs two extra read-only checks: `sudo firmwarepasswd -check` and `sudo profiles -P`. It does not change anything. On Apple Silicon, `firmwarepasswd` may report that the tool is not supported; that is normal. If `--sudo` is requested without an interactive terminal, the checks are skipped and the report shows that.
 
 ### Warranty
 
@@ -141,6 +150,27 @@ The script reads the physical NVMe disk via `diskutil info -plist` and extracts 
 
 A Mac mini has no battery, so there is no cycle count. The SSD `Power-on hours`, `Power cycles` and `Data written` are the closest equivalent to battery cycles. They persist across erases.
 
+### Unsafe shutdowns
+
+`Unsafe shutdowns` is a cumulative NVMe SMART counter. It increments when the SSD loses power without a clean shutdown/flush, for example:
+
+- holding the power button
+- power loss or unplugging
+- a kernel panic or forced restart
+- a shutdown stall that ends in a forced power-off
+
+It is **not** a wear indicator like `Percentage Used`. Compare it to `Power cycles` and `Power-on hours`:
+
+- A low ratio is usually historical and not alarming. Example: 6 / 274 power cycles = ~2.2%.
+- A high ratio, or a counter that keeps increasing, suggests repeated power loss or forced shutdowns.
+
+What to check:
+
+1. `Media errors` should be 0 and `SMART status` should be `Verified`.
+2. `Kernel panics` and `Shutdown stalls` should not be increasing.
+3. Power source should be stable: battery/charger on a laptop, cable/UPS on a Mac mini.
+4. If the counter keeps rising without forced power-offs, run Apple Diagnostics and inspect shutdown-stall reports.
+
 ### Free space
 
 The script warns if the boot volume has less than 10% free. APFS performance and updates need headroom.
@@ -175,6 +205,20 @@ Typical rough ranges:
 
 After a reset, these only cover the new install. A clean reset often has zero reports. A non-zero panic/stall count on a fresh install is more concerning than on an old install.
 
+### Shutdown stalls
+
+A `.shutdownStall` report means macOS detected a slow or stuck shutdown. It is often software (an app or background service not quitting), not a failing SSD. A short 1-second stall with many background apps is usually benign.
+
+Inspect it with:
+
+```bash
+ls -lt /Library/Logs/DiagnosticReports/*.shutdownStall
+spindump -i /Library/Logs/DiagnosticReports/<file>.shutdownStall
+# readable report: /tmp/spindump.txt
+```
+
+Look at the `Event`, `Duration`, and the processes sampled. If stalls repeat, note which apps are open, try Safe Mode, and check login items/background agents.
+
 ## 6. NVRAM / boot flags
 
 | Field | Good value | Notes |
@@ -206,7 +250,8 @@ These are inventory checks, not full hardware tests. Physically test every port.
 The script cannot test these automatically:
 
 - Apple Diagnostics (hold power on Apple Silicon, `D` on Intel)
-- Firmware password: `sudo firmwarepasswd -check`
+- Firmware password: `--sudo` (or `sudo firmwarepasswd -check`)
+- Installed profiles: `--sudo` (or `sudo profiles -P`)
 - Detailed SMART: `sudo smartctl -a /dev/disk0` (only if smartmontools is installed)
 - Every USB/Thunderbolt/HDMI/Ethernet/audio port
 - Fan noise and thermal throttling under load
@@ -221,6 +266,9 @@ The script adds a warning for:
 
 - Activation Lock enabled or unknown
 - MDM/DEP enrollment active
+- Firmware password enabled
+- Configuration profiles found
+- `--sudo` check requested but skipped
 - Supervised = true
 - FileVault is On
 - SIP disabled or customized
@@ -228,7 +276,7 @@ The script adds a warning for:
 - SMART status not `Verified`
 - SSD wear ≥ 50%
 - SSD media errors > 0
-- Unsafe shutdowns > 0
+- Unsafe shutdowns > 0 (the warning includes the ratio to power cycles)
 - Available spare below threshold
 - Free space < 10%
 - Disk speed test failed
@@ -267,7 +315,10 @@ spctl --status
 nvram -p
 df -k
 dd if=/dev/zero of=... bs=1m count=... oflag=direct
-/usr/bin/log show ...   # only with --deep-logs
+/usr/bin/log show ...            # only with --deep-logs
+sudo firmwarepasswd -check       # only with --sudo
+sudo profiles -P                 # only with --sudo
+spindump -i ...                  # to decode a shutdown stall report
 ```
 
-No third-party tools, no Python, no sudo.
+No third-party tools, no Python. `sudo` is optional and only used with `--sudo`.
