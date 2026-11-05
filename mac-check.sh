@@ -390,7 +390,9 @@ count_ips() {
   find "$1" -maxdepth 1 -type f -name '*.ips' 2>/dev/null | wc -l | tr -d ' '
 }
 count_diag() {
-  find "$1" -maxdepth 1 -type f -name '*.diag' 2>/dev/null | wc -l | tr -d ' '
+  # Exclude dd_*.diag: macOS writes a microstackshot for the script's own
+  # speed-test writes ("Event: disk writes, Action taken: none").
+  find "$1" -maxdepth 1 -type f -name '*.diag' ! -name 'dd_*.diag' 2>/dev/null | wc -l | tr -d ' '
 }
 
 collect_stability() {
@@ -407,7 +409,7 @@ collect_stability() {
   USER_IPS=$(count_ips "$UDR")
   RETIRED=$(find "$DR/Retired" -type f 2>/dev/null | wc -l | tr -d ' ')
   USER_RETIRED=$(find "$UDR/Retired" -type f 2>/dev/null | wc -l | tr -d ' ')
-  LATEST=$(ls -t "$DR" 2>/dev/null | head -5)
+  LATEST=$(ls -t "$DR" 2>/dev/null | grep -v '^dd_.*\.diag$' | head -5)
 
   INSTALL_LOG="/var/log/install.log"
   INSTALL_ERRORS=0
@@ -674,10 +676,16 @@ print_quick_summary() {
   else
     status_line "Kernel panics" "$PANICS" warn
   fi
+  if [ "$USER_PANICS" -gt 0 ] 2>/dev/null; then
+    status_line "User kernel panics" "$USER_PANICS" warn
+  fi
   if [ "$STALLS" -eq 0 ] 2>/dev/null; then
     status_line "Shutdown stalls" "$STALLS" ok
   else
     status_line "Shutdown stalls" "$STALLS" warn
+  fi
+  if [ "$INSTALL_ERRORS" -gt 0 ] 2>/dev/null; then
+    status_line "Install log errors" "$INSTALL_ERRORS" warn
   fi
 
   if [ -n "$BATT_CYCLES" ]; then
@@ -935,6 +943,7 @@ print_stability() {
   kv "Jetsam (memory) events" "$JETSAM"
   kv "Other .ips reports" "$IPS"
   kv "App .diag reports" "$DIAGS"
+  note "dd_*.diag write-monitoring reports from the speed test are excluded."
   [ "$RETIRED" -gt 0 ] 2>/dev/null && kv "Retired system reports" "$RETIRED"
   [ "$USER_PANICS" -gt 0 ] 2>/dev/null && kv "User kernel panics" "$USER_PANICS"
   [ "$USER_IPS" -gt 0 ] 2>/dev/null && kv "User .ips reports" "$USER_IPS"
